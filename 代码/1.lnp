@@ -1,0 +1,4 @@
+"main.obj",
+"PWM.obj" 
+TO "1" 
+RAMSIZE(256) 

@@ -1,0 +1,483 @@
+C51 COMPILER V9.59.0.0   MAIN                                                              04/24/2025 21:34:01 PAGE 1   
+
+
+C51 COMPILER V9.59.0.0, COMPILATION OF MODULE MAIN
+OBJECT MODULE PLACED IN ..\main.obj
+COMPILER INVOKED BY: C:\Keil_C51\C51\BIN\C51.EXE main.c OPTIMIZE(8,SPEED) BROWSE DEBUG OBJECTEXTEND TABS(2) OBJECT(..\ma
+                    -in.obj)
+
+line level    source
+
+   1          /*************************************************************
+   2                                   电动自行车胎压监测系统
+   3          
+   4          功能说明：使用PS002模拟信号传感器通过ADC0832CCN模数转换胎压
+   5                    使用DS18B20数字温度传感器测量轮胎温度
+   6                    使用PWM控制电机转速，实现限速功能
+   7          ***************************************************************/
+   8          #include <reg52.h>
+   9          #include <LCD1602.h>
+  10          #include <PS002.h>
+  11          #include <DS18B20.h>
+  12          #include <PWM.h>
+  13          
+  14          // 类型定义
+  15          #define uchar unsigned char
+  16          #define uint unsigned int
+  17          
+  18          // 常量定义
+  19          #define MOTOR_SPEED_MAX 100
+  20          #define TEMP_UPDATE_INTERVAL 200
+  21          #define PWM_PERIOD 100
+  22          #define DEFAULT_TEMP_UP 45
+  23          #define DEFAULT_TEMP_DOWN 10
+  24          #define DISPLAY_REFRESH_RATE 20  // 显示刷新率(ms)
+  25          #define PWM_TIMER_VALUE 0xFC66   // 定时器1的1ms定时值
+  26          
+  27          // ASCII字符表 - 用于数字显示（0-9的ASCII码）
+  28          unsigned char code ASCII[] = {
+  29              0x30,0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x38,0x39 // '0'-'9'的ASCII码
+  30          };
+  31          
+  32          // 声明外部 CGRAM_TABLE (在 LCD1602 模块中定义)
+  33          extern unsigned char code CGRAM_TABLE[]; 
+  34          
+  35          // 位定义
+  36          sbit temp_led = P3^6;    // P3^6 温度超限指示灯
+  37          sbit tire_led = P3^7;    // P3^7 胎压超限指示灯
+  38          sbit buzz = P2^3;        // P2^3 蜂鸣器
+  39          sbit key_set = P1^0;     // P1^0 设置键
+  40          sbit key_jia = P1^3;     // P1^3 加键
+  41          sbit key_jian = P1^6;    // P1^6 减键
+  42          sbit DO_DI_0832 = P2^4;  // P2^4 ADC0832数据输入输出
+  43          
+  44          // 全局变量声明
+  45          static unsigned char pwm_count = 0;
+  46          static unsigned char temp_count = 0;
+  47          static bit temp_update_flag = 0;
+  48          static bit alarm = 0;
+  49          static unsigned char motor_speed = MOTOR_SPEED_MAX;
+  50          static uchar error_count = 0;  // 添加error_count全局变量
+  51          
+  52          
+  53          // 胎压和温度变量
+  54          unsigned char pressure_scaled_x10; // 新变量：压力值 * 10
+C51 COMPILER V9.59.0.0   MAIN                                                              04/24/2025 21:34:01 PAGE 2   
+
+  55          uchar temp_z; // 温度整数部分
+  56          uchar temp_x; // 温度小数部分
+  57          
+  58          // 声明外部变量
+  59          extern unsigned int adc_value;    // ADC转换结果，在PS002.c中定义
+  60          
+  61          // 设置变量
+  62          uchar set_f = 0;           // 设置选择标记
+  63                                    // =0非设置，=1设置胎压上限，=2设置胎压下限
+  64          uchar T0_num = 0;         // 计数变量
+  65          uchar display_mode = 0;   // 显示模式：0-温度和胎压，1-转速
+  66          
+  67          // 自定义字符变量
+  68          unsigned char pic = 0;  // 自定义字符-度数符号索引
+  69          
+  70          // 温度和胎压限值
+  71          uchar temp_up = DEFAULT_TEMP_UP;     // 温度上限值
+  72          uchar temp_down = DEFAULT_TEMP_DOWN; // 温度下限值
+  73          uchar tire_up = 40; // 4.0 Bar * 10
+  74          uchar tire_down = 32; // 3.2 Bar * 10
+  75          
+  76          // 函数声明
+  77          void fixed_display(void);
+  78          void display_tire_info(void);
+  79          void scan(void);
+  80          void display(void);
+  81          void Delay_ms(uint ms);
+  82          void PWM_init(void);
+  83          void check_alarm(void);
+  84          void fixed_display_set(void);
+  85          
+  86          // 定时器1中断服务函数
+  87          void Timer1_Interrupt() interrupt 3 using 0
+  88          {
+  89   1          // 重新加载定时器值(1ms周期)
+  90   1          TH1 = (PWM_TIMER_VALUE >> 8) & 0xFF;
+  91   1          TL1 = PWM_TIMER_VALUE & 0xFF;
+  92   1          
+  93   1          // PWM控制 - 根据占空比控制输出
+  94   1          PWM_OUT = (++pwm_count < motor_speed) ? 1 : 0;
+  95   1          if(pwm_count >= PWM_PERIOD) pwm_count = 0;
+  96   1          
+  97   1          // 温度更新 - 每200ms(200个周期)触发一次
+  98   1          if(++temp_count >= TEMP_UPDATE_INTERVAL) {
+  99   2              temp_count = 0;
+ 100   2              temp_update_flag = 1;
+ 101   2          }
+ 102   1      }
+ 103          
+ 104          /********************************************************
+ 105          函数名称:void fixed_display(void)
+ 106          函数功能:LCD1602显示固定的内容 (恢复温度标签)
+ 107          参数说明:无
+ 108          ********************************************************/
+ 109          void fixed_display(void)
+ 110          {
+ 111   1          LCD_clear(); // 使用我们定义的清屏函数
+ 112   1      
+ 113   1          if(display_mode == 0) // 温度和胎压显示模式
+ 114   1          {
+ 115   2              lcd1602_write_character(0,1,"Tire:");
+ 116   2              lcd1602_write_character(12,1,"Bar");
+C51 COMPILER V9.59.0.0   MAIN                                                              04/24/2025 21:34:01 PAGE 3   
+
+ 117   2      
+ 118   2              // 恢复温度标签
+ 119   2              lcd1602_write_character(0,2,"Temp:");
+ 120   2              LCD_disp_char(12,2,pic);  // 显示自定义字符'°' (使用全局变量 pic)
+ 121   2              LCD_disp_char(13,2,'C');   // 显示'C'字
+ 122   2          }
+ 123   1          else // 转速显示模式
+ 124   1          {
+ 125   2              lcd1602_write_character(0,1,"Speed:");
+ 126   2              lcd1602_write_character(12,1,"%");
+ 127   2              lcd1602_write_character(0,2,"Mode: Auto");
+ 128   2          }
+ 129   1      }
+ 130          
+ 131          /********************************************************
+ 132          函数名称:void display_tire_info(void)
+ 133          函数功能:显示轮胎的胎压和温度信息 (使用新变量)
+ 134          参数说明:
+ 135              无
+ 136          ********************************************************/
+ 137          void display_tire_info(void) {
+ 138   1          uchar pres_int, pres_dec;
+ 139   1      
+ 140   1          // 第一行：显示胎压 X.Y Bar
+ 141   1          pres_int = pressure_scaled_x10 / 10; // 获取整数部分 (e.g., 33 -> 3)
+ 142   1          pres_dec = pressure_scaled_x10 % 10; // 获取小数部分 (e.g., 33 -> 3)
+ 143   1          LCD_disp_char(7,1, ASCII[pres_int]);     // 显示整数位
+ 144   1          LCD_disp_char(8,1,'.');
+ 145   1          LCD_disp_char(9,1, ASCII[pres_dec]);     // 显示小数位
+ 146   1      
+ 147   1          // 第二行：显示温度值 XX.Y °C
+ 148   1          LCD_disp_char(7,2, ASCII[temp_z/10]);
+ 149   1          LCD_disp_char(8,2, ASCII[temp_z%10]);
+ 150   1          LCD_disp_char(9,2, '.');
+ 151   1          LCD_disp_char(10,2, ASCII[temp_x]);
+ 152   1      
+ 153   1      }
+ 154          
+ 155          /********************************************************
+ 156          函数名称:void fixed_display_set(void)
+ 157          函数功能:LCD1602显示设置界面的固定内容
+ 158          参数说明:无
+ 159          ********************************************************/
+ 160          void fixed_display_set(void)
+ 161          {
+ 162   1          LCD_clear(); 
+ 163   1          lcd1602_write_character(0,1,"P Up:"); 
+ 164   1          lcd1602_write_character(8,1,"Down:");
+ 165   1          lcd1602_write_character(0,2,"Speed:");
+ 166   1          lcd1602_write_character(9,2,"%");
+ 167   1          // 在 display 函数中显示数值
+ 168   1      }
+ 169          
+ 170          /********************************************************
+ 171          函数名称:void scan(void)
+ 172          函数功能:扫描按键，处理正常模式切换和设置模式调整
+ 173          参数说明:无
+ 174          ********************************************************/
+ 175          void scan(void)
+ 176          {
+ 177   1        
+ 178   1          // 阈值限制
+C51 COMPILER V9.59.0.0   MAIN                                                              04/24/2025 21:34:01 PAGE 4   
+
+ 179   1          uchar TIRE_MIN = 10; // 1.0 Bar
+ 180   1          uchar TIRE_MAX = 50; // 5.0 Bar
+ 181   1          signed char TEMP_MIN_INT = -55; // -55 C
+ 182   1          uchar TEMP_MAX_INT = 125; // 125 C
+ 183   1      
+ 184   1          // 1. 处理设置键 (key_set - P1.0)
+ 185   1          if(key_set == 0) {
+ 186   2              Delay_ms(5); // 消抖
+ 187   2              if(key_set == 0) {
+ 188   3                  if (set_f == 0) { // 从正常模式进入设置模式
+ 189   4                      set_f = 1; // 进入设置胎压上限
+ 190   4                      fixed_display_set(); // 显示设置界面固定文本
+ 191   4                  } else { // 循环切换设置项或退出
+ 192   4                      set_f++;
+ 193   4                      if (set_f > 2) { // <-- 修改退出条件为 > 2
+ 194   5                          set_f = 0;
+ 195   5                          // TODO: 此处可以添加保存阈值到 EEPROM 的逻辑
+ 196   5                          fixed_display(); // 恢复正常显示界面
+ 197   5                      } else {
+ 198   5                         // 切换到下一个设置项，不需要重绘固定文本，只需 display 函数更
+             -新闪烁
+ 199   5                         T0_num = 0; // 重置闪烁计时器，立即显示新选中项
+ 200   5                      }
+ 201   4                  }
+ 202   3                  while(!key_set); // 等待按键释放
+ 203   3              }
+ 204   2          }
+ 205   1      
+ 206   1          // 2. 处理加键 (key_jia - P1.3) - 仅在设置模式下有效
+ 207   1          if(set_f > 0 && key_jia == 0) {
+ 208   2              Delay_ms(1); // 消抖
+ 209   2              if(key_jia == 0) {
+ 210   3                  T0_num = 0; // 重置闪烁计时，立即显示新值
+ 211   3                  switch(set_f) {
+ 212   4                      case 1: // 设置胎压上限
+ 213   4                          if (tire_up < TIRE_MAX) tire_up++;
+ 214   4                          break;
+ 215   4                      case 2: // 设置胎压下限
+ 216   4                          // 确保下限不超过上限
+ 217   4                          if (tire_down < tire_up && tire_down < TIRE_MAX) tire_down++; 
+ 218   4                          break;
+ 219   4                  }
+ 220   3                  while(!key_jia); // 等待按键释放
+ 221   3              }
+ 222   2          }
+ 223   1      
+ 224   1          // 3. 处理减键 (key_jian - P1.6) - 仅在设置模式下有效
+ 225   1          if(set_f > 0 && key_jian == 0) {
+ 226   2              Delay_ms(1); // 消抖
+ 227   2              if(key_jian == 0) {
+ 228   3                  T0_num = 0; // 重置闪烁计时，立即显示新值
+ 229   3                  switch(set_f) {
+ 230   4                      case 1: // 设置胎压上限
+ 231   4                          // 确保上限不低于下限
+ 232   4                          if (tire_up > tire_down && tire_up > TIRE_MIN) tire_up--;
+ 233   4                          break;
+ 234   4                      case 2: // 设置胎压下限
+ 235   4                          if (tire_down > TIRE_MIN) tire_down--;
+ 236   4                          break;
+ 237   4                  }
+ 238   3                  while(!key_jian); // 等待按键释放
+ 239   3              }
+C51 COMPILER V9.59.0.0   MAIN                                                              04/24/2025 21:34:01 PAGE 5   
+
+ 240   2          }
+ 241   1      }
+ 242          
+ 243          /********************************************************
+ 244          函数名称:void display(void)
+ 245          函数功能:根据当前模式显示数据
+ 246          参数说明:无
+ 247          ********************************************************/
+ 248          void display(void)
+ 249          {
+ 250   1          if (set_f == 0) { // 非设置状态
+ 251   2              if (display_mode == 0) { // 温度和胎压显示模式
+ 252   3                  display_tire_info();
+ 253   3              } else { // 转速显示模式
+ 254   3                  // 显示电机速度
+ 255   3                  LCD_disp_char(7, 1, ASCII[motor_speed / 10]); 
+ 256   3                  LCD_disp_char(8, 1, ASCII[motor_speed % 10]);
+ 257   3                  lcd1602_write_character(7, 2, alarm ? "Limited" : "Normal ");
+ 258   3              }
+ 259   2          } else { // 设置状态
+ 260   2              // 设置模式下的显示
+ 261   2              T0_num++;
+ 262   2              
+ 263   2              // 始终在第二行显示当前速度
+ 264   2              LCD_disp_char(6, 2, ASCII[motor_speed / 10]); // 调整速度显示位置
+ 265   2              LCD_disp_char(7, 2, ASCII[motor_speed % 10]);
+ 266   2      
+ 267   2              if(T0_num % 2 == 0) {
+ 268   3                  // 显示胎压设置值 (第一行)
+ 269   3                  LCD_disp_char(5,1,ASCII[tire_up / 10]);
+ 270   3                  LCD_disp_char(6,1,'.');
+ 271   3                  LCD_disp_char(7,1,ASCII[tire_up % 10]);
+ 272   3                  LCD_disp_char(13,1,ASCII[tire_down / 10]);
+ 273   3                  LCD_disp_char(14,1,'.');
+ 274   3                  LCD_disp_char(15,1,ASCII[tire_down % 10]);
+ 275   3              } else {
+ 276   3                  // 闪烁显示当前设置项 (只影响第一行)
+ 277   3                  switch(set_f) {
+ 278   4                      case 1: lcd1602_write_character(5,1,"   "); break;
+ 279   4                      case 2: lcd1602_write_character(13,1,"   "); break;
+ 280   4                      default: break; // set_f 为 0 时不闪烁 (虽然理论上不会进入这里)
+ 281   4                  }
+ 282   3              }
+ 283   2              // 限制 T0_num 大小防止溢出和长时间不显示
+ 284   2              if (T0_num > 20) T0_num = 0; 
+ 285   2          }
+ 286   1      }
+ 287          
+ 288          /********************************************************
+ 289          函数名称:void Delay_ms(uint ms)
+ 290          函数功能:毫秒延时函数
+ 291          参数说明:ms - 延时毫秒数
+ 292          ********************************************************/ 
+ 293          // 使用定时器0实现精确延时 - 优化实现
+ 294          void Delay_ms(uint ms) {
+ 295   1          TMOD = (TMOD & 0xF0) | 0x01; // 设置定时器0为模式1
+ 296   1          TR0 = 0;
+ 297   1          while(ms--) {
+ 298   2              TH0 = 0xFC; // 1ms定时值(FC18H = 64536，延时约1ms)
+ 299   2              TL0 = 0x18;
+ 300   2              TR0 = 1;
+ 301   2              while(!TF0); // 等待溢出
+C51 COMPILER V9.59.0.0   MAIN                                                              04/24/2025 21:34:01 PAGE 6   
+
+ 302   2              TR0 = 0;
+ 303   2              TF0 = 0;
+ 304   2          }
+ 305   1      }
+ 306          
+ 307          /********************************************************
+ 308          函数名称:void PWM_init(void)
+ 309          函数功能:PWM初始化函数
+ 310          参数说明:无
+ 311          ********************************************************/ 
+ 312          // PWM初始化函数 - 配置定时器1生成PWM信号
+ 313          void PWM_init(void) {
+ 314   1          TMOD = (TMOD & 0x0F) | 0x10; // 设置定时器1为模式1（16位定时器）
+ 315   1          TH1 = 0xFC; // 设置1ms定时值(FC66H = 64614)
+ 316   1          TL1 = 0x66;
+ 317   1          ET1 = 1;    // 使能定时器1中断
+ 318   1          EA = 1;     // 开总中断
+ 319   1          TR1 = 1;    // 启动定时器1
+ 320   1      }
+ 321          
+ 322          /********************************************************
+ 323          函数名称:void check_alarm(void)
+ 324          函数功能:检查报警条件,控制指示灯和电机转速
+ 325          参数说明:无
+ 326          ********************************************************/
+ 327          void check_alarm(void)
+ 328          {
+ 329   1          // 声明所有bit类型变量在函数开头
+ 330   1          bit is_pressure_normal, temp_alarm_high;
+ 331   1          
+ 332   1          // 1. 检查压力是否在正常范围内
+ 333   1          is_pressure_normal = (pressure_scaled_x10 >= tire_down) && (pressure_scaled_x10 <= tire_up);
+ 334   1      
+ 335   1          // 2. 根据压力状态控制指示灯
+ 336   1          if (is_pressure_normal)
+ 337   1          {
+ 338   2              // 压力正常: 绿灯亮, 红灯灭
+ 339   2              tire_led = 0; // P3.7 (Green) ON
+ 340   2              temp_led = 1; // P3.6 (Red) OFF
+ 341   2          }
+ 342   1          else
+ 343   1          {
+ 344   2              // 压力异常: 绿灯灭, 红灯亮
+ 345   2              tire_led = 1; // P3.7 (Green) OFF
+ 346   2              temp_led = 0; // P3.6 (Red) ON
+ 347   2          }
+ 348   1      
+ 349   1          // 3. 温度报警检测
+ 350   1          temp_alarm_high = (temp_z >= temp_up);
+ 351   1          
+ 352   1          // 4. 设置报警标志
+ 353   1          alarm = !is_pressure_normal || temp_alarm_high; // 包含温度异常
+ 354   1          
+ 355   1          // 5. 根据报警状态控制蜂鸣器
+ 356   1           buzz = 1; // <-- 强制关闭蜂鸣器
+ 357   1         //buzz = alarm ? 0 : 1;  // 报警时蜂鸣器响(0)，正常时关闭(1)
+ 358   1      
+ 359   1          // 6. 根据压力范围设置电机转速
+ 360   1          if (is_pressure_normal)
+ 361   1          {
+ 362   2              motor_speed = 60; // 正常时固定速度 (或使用之前的 MAX)
+ 363   2          }
+C51 COMPILER V9.59.0.0   MAIN                                                              04/24/2025 21:34:01 PAGE 7   
+
+ 364   1          else
+ 365   1          {
+ 366   2              motor_speed = 30; // 异常时低速
+ 367   2          }
+ 368   1      }
+ 369          
+ 370          /********************************************************
+ 371          函数名称:void main()
+ 372          函数功能:主函数
+ 373          参数说明:无
+ 374          ********************************************************/
+ 375          void main(void)
+ 376          {
+ 377   1          // 配置中断优先级
+ 378   1          PT0 = 1;       // 定时器0高优先级（用于ADC采样）
+ 379   1          PT1 = 0;       // 定时器1低优先级（用于PWM控制）
+ 380   1          PS = 1;        // 串口中断低优先级
+ 381   1      
+ 382   1          // 初始化显示模块
+ 383   1          LCD_init();                // 初始化LCD1602显示屏
+ 384   1          Delay_ms(10);              // 等待LCD稳定
+ 385   1      
+ 386   1          // 写入自定义字符
+ 387   1          lcd1602_write_pic(0,&CGRAM_TABLE[0]);  // 度数符号'°'
+ 388   1          
+ 389   1          // DS18B20传感器初始化 - 确保稳定启动
+ 390   1          DS18B20_Init();            // 初始化DS18B20总线  
+ 391   1          Delay_ms(50);              // 等待稳定时间增加到50ms
+ 392   1          
+ 393   1          // 预热传感器 - 先进行几次测量确保稳定性
+ 394   1          DS18B20_StartConvert();    // 启动初次转换
+ 395   1          Delay_ms(800);             // 等待转换完成
+ 396   1          DS18B20_GetTemp();         // 读取并丢弃初次结果
+ 397   1          
+ 398   1          // 继续原来的初始化
+ 399   1          PS002_init();
+ 400   1          PWM_init();
+ 401   1          
+ 402   1          // 初始化状态
+ 403   1          fixed_display();
+ 404   1      
+ 405   1          buzz = 1;
+ 406   1          temp_led = 1;
+ 407   1          tire_led = 1;
+ 408   1          motor_speed = 60;
+ 409   1      
+ 410   1          // 主循环
+ 411   1          while(1)
+ 412   1          {
+ 413   2              // 处理胎压数据
+ 414   2              PS002_Convert(); 
+ 415   2              pressure_scaled_x10 = (adc_value * 37 + 50) / 100;
+ 416   2      
+ 417   2              // 处理温度数据 - 改进温度更新逻辑
+ 418   2              if(temp_update_flag) {
+ 419   3                  DS18B20_Convert();  // 自带重试机制的温度转换函数
+ 420   3                  temp_update_flag = 0;
+ 421   3                  
+ 422   3                  // 如果显示错误温度(88.8)持续超过3次，尝试复位传感器
+ 423   3                  if(temp_z == 88 && temp_x == 8) {
+ 424   4                      error_count++;
+ 425   4                      if(error_count >= 3) {
+C51 COMPILER V9.59.0.0   MAIN                                                              04/24/2025 21:34:01 PAGE 8   
+
+ 426   5                          DS18B20_Init();  // 重新初始化传感器
+ 427   5                          Delay_ms(50);    // 给传感器一些恢复时间
+ 428   5                          DS18B20_Convert(); // 再次尝试读取
+ 429   5                          error_count = 0;   // 重置错误计数
+ 430   5                      }
+ 431   4                  } else {
+ 432   4                      error_count = 0;  // 正常温度，重置错误计数
+ 433   4                  }
+ 434   3              }
+ 435   2      
+ 436   2              // 系统状态更新
+ 437   2              check_alarm();
+ 438   2              scan();
+ 439   2              display();
+ 440   2      
+ 441   2              // 控制刷新频率
+ 442   2              Delay_ms(DISPLAY_REFRESH_RATE);
+ 443   2          } // while(1)循环结束
+ 444   1      } // main函数结束
+
+
+MODULE INFORMATION:   STATIC OVERLAYABLE
+   CODE SIZE        =   1767    ----
+   CONSTANT SIZE    =     78    ----
+   XDATA SIZE       =   ----    ----
+   PDATA SIZE       =   ----    ----
+   DATA SIZE        =     38      17
+   IDATA SIZE       =   ----    ----
+   BIT SIZE         =      3       4
+END OF MODULE INFORMATION.
+
+
+C51 COMPILATION COMPLETE.  0 WARNING(S),  0 ERROR(S)
